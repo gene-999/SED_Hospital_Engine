@@ -33,5 +33,8 @@ class Settings(BaseSettings):
     # Initial search radius (km)
     DEFAULT_SEARCH_RADIUS_KM: float = 20.0
 
+    # Render — set automatically by Render, used for self-ping keep-alive
+    RENDER_EXTERNAL_URL: str = ""
+
 
 settings = Settings()

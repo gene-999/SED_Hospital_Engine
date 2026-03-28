@@ -8,6 +8,12 @@ from app.services import hospital as hospital_service
 router = APIRouter(prefix="/hospitals", tags=["hospitals"])
 
 
+@router.get("", response_model=list[HospitalOut])
+async def list_hospitals() -> list[HospitalOut]:
+    """Returns all hospitals that have at least one available bed."""
+    return await hospital_service.list_hospitals()
+
+
 @router.post("", response_model=HospitalOut, status_code=status.HTTP_201_CREATED)
 async def create_hospital(
     data: HospitalCreate,

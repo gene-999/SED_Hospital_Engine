@@ -14,6 +14,7 @@ class Hospital(Document):
         default_factory=lambda: {"type": "Point", "coordinates": [0.0, 0.0]}
     )
     address: str
+    image_url: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
     opening_hours: dict[str, Any] = Field(default_factory=dict)

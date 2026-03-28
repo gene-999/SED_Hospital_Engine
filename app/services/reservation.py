@@ -27,6 +27,26 @@ async def create_reservation(
     if not ward or str(ward.hospital_id) != data.hospital_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ward not found in hospital")
 
+    # Auto-assign an available bed atomically at creation time
+    collection = Bed.get_pymongo_collection()
+    result = await collection.find_one_and_update(
+        {
+            "ward_id": ObjectId(str(ward.id)),
+            "status": BedStatus.AVAILABLE,
+        },
+        {"$set": {"status": BedStatus.RESERVED}},
+        sort=[("created_at", 1)],
+        return_document=True,
+    )
+
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No available beds in this ward",
+        )
+
+    bed_id = result["_id"]
+
     reservation = Reservation(
         user_id=current_user.id if current_user else None,
         patient_name=data.patient_name or (current_user.name if current_user else None),
@@ -35,12 +55,25 @@ async def create_reservation(
         patient_lng=data.patient_lng,
         hospital_id=hospital.id,
         ward_id=ward.id,
+        bed_id=bed_id,
+        status=ReservationStatus.PENDING,
     )
     await reservation.insert()
 
+    # Update the bed to link back to the reservation
+    await collection.update_one(
+        {"_id": bed_id},
+        {"$set": {"reservation_id": reservation.id}},
+    )
+
     await manager.broadcast(
         f"hospital:{data.hospital_id}",
-        {"event": "new_reservation", "reservation_id": str(reservation.id)},
+        {
+            "event": "new_reservation",
+            "reservation_id": str(reservation.id),
+            "bed_id": str(bed_id),
+            "ward_id": data.ward_id,
+        },
     )
     return _to_out(reservation)
 
@@ -52,36 +85,12 @@ async def accept_reservation(reservation_id: str, admin: User) -> ReservationOut
     if reservation.status != ReservationStatus.PENDING:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Reservation is not pending")
 
-    # Atomic bed assignment — prevents double booking
-    collection = Bed.get_pymongo_collection()
-    result = await collection.find_one_and_update(
-        {
-            "ward_id": ObjectId(str(reservation.ward_id)),
-            "status": BedStatus.AVAILABLE,
-        },
-        {
-            "$set": {
-                "status": BedStatus.RESERVED,
-                "reservation_id": ObjectId(str(reservation.id)),
-            }
-        },
-        sort=[("created_at", 1)],
-        return_document=True,
-    )
-
-    if result is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No available beds in this ward")
-
-    bed_id = result["_id"]
     hospital = await Hospital.get(reservation.hospital_id)
-
-    # Compute ETA-based expiry using Mapbox
     expires_at = await _compute_expiry(reservation, hospital)
 
     await reservation.set(
         {
             Reservation.status: ReservationStatus.ACCEPTED,
-            Reservation.bed_id: bed_id,
             Reservation.expires_at: expires_at,
         }
     )
@@ -92,13 +101,9 @@ async def accept_reservation(reservation_id: str, admin: User) -> ReservationOut
         {
             "event": "reservation_accepted",
             "reservation_id": reservation_id,
-            "bed_id": str(bed_id),
+            "bed_id": str(reservation.bed_id),
             "expires_at": expires_at.isoformat(),
         },
-    )
-    await manager.broadcast(
-        f"ward:{str(reservation.ward_id)}",
-        {"event": "bed_reserved", "bed_id": str(bed_id)},
     )
     return _to_out(reservation)
 
@@ -109,6 +114,16 @@ async def decline_reservation(reservation_id: str, admin: User) -> ReservationOu
 
     if reservation.status != ReservationStatus.PENDING:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Reservation is not pending")
+
+    # Release the bed back to available
+    if reservation.bed_id:
+        bed = await Bed.get(reservation.bed_id)
+        if bed:
+            await bed.set({Bed.status: BedStatus.AVAILABLE, Bed.reservation_id: None})
+            await manager.broadcast(
+                f"ward:{str(reservation.ward_id)}",
+                {"event": "bed_available", "bed_id": str(reservation.bed_id)},
+            )
 
     await reservation.set({Reservation.status: ReservationStatus.DECLINED})
     await reservation.sync()
@@ -144,7 +159,6 @@ async def cancel_reservation(
 ) -> ReservationOut:
     reservation = await _get_or_404(reservation_id)
 
-    # Allow cancellation if: authenticated owner OR correct cancel_token
     is_owner = current_user and str(reservation.user_id) == str(current_user.id)
     has_token = reservation.cancel_token == cancel_token
 
@@ -157,7 +171,8 @@ async def cancel_reservation(
     if reservation.status not in (ReservationStatus.PENDING, ReservationStatus.ACCEPTED):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cannot cancel at this stage")
 
-    if reservation.bed_id and reservation.status == ReservationStatus.ACCEPTED:
+    # Release the bed
+    if reservation.bed_id:
         bed = await Bed.get(reservation.bed_id)
         if bed:
             await bed.set({Bed.status: BedStatus.AVAILABLE, Bed.reservation_id: None})
@@ -172,11 +187,6 @@ async def cancel_reservation(
 
 
 async def _compute_expiry(reservation: Reservation, hospital: Optional[Hospital]) -> datetime:
-    """
-    Query Mapbox for driving duration from patient to hospital.
-    expires_at = now + drive_duration + EXPIRY_BUFFER_MINUTES.
-    Falls back to EXPIRY_FALLBACK_MINUTES if Mapbox is unavailable.
-    """
     now = datetime.now(timezone.utc)
     buffer = timedelta(minutes=settings.EXPIRY_BUFFER_MINUTES)
 
@@ -194,8 +204,11 @@ async def _compute_expiry(reservation: Reservation, hospital: Optional[Hospital]
         if duration_seconds is not None:
             return now + timedelta(seconds=duration_seconds) + buffer
 
-    # Fallback
     return now + timedelta(minutes=settings.EXPIRY_FALLBACK_MINUTES)
+
+
+async def get_reservation(reservation_id: str) -> ReservationOut:
+    return _to_out(await _get_or_404(reservation_id))
 
 
 async def _get_or_404(reservation_id: str) -> Reservation:

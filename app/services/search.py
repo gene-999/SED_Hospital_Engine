@@ -90,7 +90,7 @@ async def _execute_search(
     # ── 1. Geospatial query via MongoDB 2dsphere index ────────────────────────
     # $near returns documents sorted by distance ascending automatically.
     collection = Hospital.get_pymongo_collection()
-    max_distance_meters = filters.radius_km * 1000
+    max_distance_meters = (filters.radius_km or 10) * 1000
 
     raw_hospitals = await collection.find(
         {

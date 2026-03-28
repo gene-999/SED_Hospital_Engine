@@ -2,8 +2,21 @@ from fastapi import HTTPException, status
 
 from app.models.hospital import Hospital
 from app.models.bed import Bed, BedStatus
+from app.models.ward import Ward
 from app.models.user import User
 from app.schemas.hospital import HospitalCreate, HospitalUpdate, HospitalOut
+
+
+async def list_hospitals() -> list[HospitalOut]:
+    """Return all hospitals that have at least one available bed, sorted by availability."""
+    hospitals = await Hospital.find_all().to_list()
+    results = []
+    for hospital in hospitals:
+        out = await _to_out(hospital)
+        if out.available_beds > 0:
+            results.append(out)
+    results.sort(key=lambda h: h.available_beds, reverse=True)
+    return results
 
 
 async def create_hospital(data: HospitalCreate, admin: User) -> HospitalOut:
@@ -16,6 +29,7 @@ async def create_hospital(data: HospitalCreate, admin: User) -> HospitalOut:
         admin_id=admin.id,
         location=Hospital.make_location(data.lat, data.lng),
         address=data.address,
+        image_url=data.image_url,
         phone=data.phone,
         email=data.email,
         opening_hours=data.opening_hours,
@@ -35,7 +49,6 @@ async def update_hospital(hospital_id: str, data: HospitalUpdate, admin: User) -
 
     updates = data.model_dump(exclude_none=True)
 
-    # If lat/lng are being updated, rebuild the GeoJSON location field
     lat = updates.pop("lat", None)
     lng = updates.pop("lng", None)
     if lat is not None or lng is not None:
@@ -62,10 +75,23 @@ def _assert_owner(hospital: Hospital, admin: User) -> None:
 
 
 async def _to_out(hospital: Hospital) -> HospitalOut:
-    available_beds = await Bed.find(
-        Bed.hospital_id == hospital.id,
-        Bed.status == BedStatus.AVAILABLE,
-    ).count()
+    wards = await Ward.find(Ward.hospital_id == hospital.id).to_list()
+
+    total_available = 0
+    ward_summaries = []
+    for ward in wards:
+        count = await Bed.find(
+            Bed.ward_id == ward.id,
+            Bed.status == BedStatus.AVAILABLE,
+        ).count()
+        total_available += count
+        ward_summaries.append({
+            "ward_id": str(ward.id),
+            "name": ward.name,
+            "total_beds": ward.total_beds,
+            "available_beds": count,
+        })
+
     return HospitalOut(
         id=str(hospital.id),
         hospital_name=hospital.hospital_name,
@@ -73,8 +99,10 @@ async def _to_out(hospital: Hospital) -> HospitalOut:
         lat=hospital.lat,
         lng=hospital.lng,
         address=hospital.address,
+        image_url=hospital.image_url,
         phone=hospital.phone,
         email=hospital.email,
         opening_hours=hospital.opening_hours,
-        available_beds=available_beds,
+        available_beds=total_available,
+        wards=ward_summaries,
     )
